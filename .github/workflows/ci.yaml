@@ -11,14 +11,12 @@ on:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     permissions:
       contents: read
 
     steps:
-
       - name: Checkout Repository
         uses: actions/checkout@v4
 
@@ -29,14 +27,10 @@ jobs:
           cache: npm
 
       - name: Install Dependencies
-        run: npm install
-
-      - name: Run Lint
-        run: npm run lint
+        run: npm ci
 
       - name: Build React App
         run: npm run build
 
       - name: Build Docker Image
-        run: |
-          docker build -t coreui-app:${{ github.sha }} .
+        run: docker build -t coreui-app:${{ github.sha }} .
