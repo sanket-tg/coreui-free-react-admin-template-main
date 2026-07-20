@@ -1,73 +1,3 @@
-# name: Deploy to Amazon ECS
-
-# on:
-#   push:
-#     branches:
-#       - main
-
-# permissions:
-#   id-token: write
-#   contents: read
-
-# jobs:
-#   deploy:
-#     name: Deploy to ECS
-#     runs-on: ubuntu-latest
-
-#     steps:
-#       - name: Checkout Repository
-#         uses: actions/checkout@v4
-
-#       - name: Debug GitHub Context
-#         run: |
-#           echo "Repository: ${{ github.repository }}"
-#           echo "Ref: ${{ github.ref }}"
-#           echo "Event: ${{ github.event_name }}"
-#           echo "SHA: ${{ github.sha }}"
-
-#       - name: Configure AWS Credentials
-#         uses: aws-actions/configure-aws-credentials@v4
-#         with:
-#           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-#           aws-region: ${{ vars.AWS_REGION }}
-
-#       - name: Login to Amazon ECR
-#         id: login-ecr
-#         uses: aws-actions/amazon-ecr-login@v2
-
-#       - name: Build, Tag and Push Docker Image
-#         id: build-image
-#         env:
-#           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-#           ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-#           IMAGE_TAG: ${{ github.sha }}
-#         run: |
-#           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-#           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-#           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-
-#       - name: Render Amazon ECS Task Definition
-#         id: render-task-definition
-#         uses: aws-actions/amazon-ecs-render-task-definition@v1
-#         with:
-#           task-definition: task-definition.json
-#           container-name: ${{ vars.CONTAINER_NAME }}
-#           image: ${{ steps.build-image.outputs.image }}
-
-#       - name: Deploy Amazon ECS Task Definition
-#         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-#         with:
-#           task-definition: ${{ steps.render-task-definition.outputs.task-definition }}
-#           service: ${{ vars.ECS_SERVICE }}
-#           cluster: ${{ vars.ECS_CLUSTER }}
-#           wait-for-service-stability: true
-
-
-          
-
-
-
-
 name: Deploy to Amazon ECS
 
 on:
@@ -95,12 +25,11 @@ jobs:
           echo "Event: ${{ github.event_name }}"
           echo "SHA: ${{ github.sha }}"
 
-      - name: Debug Role ARN
+      - name: Debug OIDC Token
         run: |
-          echo "Role ARN length: ${#AWS_ROLE_ARN}"
-          echo "First 20 chars: ${AWS_ROLE_ARN:0:20}"
-        env:
-          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com")
+          echo "$TOKEN" | jq -r '.value' | cut -d'.' -f2 | base64 -d 2>/dev/null | jq '{sub, aud, iss}'
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
