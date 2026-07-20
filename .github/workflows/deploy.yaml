@@ -68,8 +68,7 @@
 
 
 
-
-          name: Deploy to Amazon ECS
+name: Deploy to Amazon ECS
 
 on:
   push:
