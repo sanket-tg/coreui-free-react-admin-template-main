@@ -1,7 +1,7 @@
 {
   "containerDefinitions": [
     {
-      "name": "ecs-demo",
+      "name": "app",
       "image": "573723531348.dkr.ecr.us-east-1.amazonaws.com/ecs-demo",
       "cpu": 0,
       "portMappings": [
@@ -32,7 +32,7 @@
       "systemControls": []
     }
   ],
-  "family": "ecs-demo",
+  "family": "myapp-dev-task",
   "taskRoleArn": "arn:aws:iam::573723531348:role/ecsTaskExecutionRole",
   "executionRoleArn": "arn:aws:iam::573723531348:role/ecsTaskExecutionRole",
   "networkMode": "awsvpc",
