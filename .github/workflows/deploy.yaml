@@ -1,79 +1,183 @@
-name: Build and Deploy (Blue-Green)
+name: CI/CD Pipeline — Build, Push, Deploy (Blue-Green)
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+  CONTAINER_NAME: app
+
 jobs:
-  build-and-deploy:
-    name: Build, Push, and Deploy (Blue-Green)
+  # ─────────────────────────────────────────────
+  # JOB 1 — CI: Build & Test
+  # ─────────────────────────────────────────────
+  ci:
+    name: CI — Build & Test
     runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
 
     steps:
-      # ─── Checkout ───────────────────────────────────────────────
-      - name: Checkout Repository
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      # ─── CI: Build React App ────────────────────────────────────
+      - name: Set image tag
+        id: meta
+        run: echo "image_tag=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: npm ci
 
-      - name: Build React App
+      - name: Build React app
         run: npm run build
 
-      # ─── AWS Authentication ─────────────────────────────────────
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (test only)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run container smoke test
+        run: |
+          docker run --rm -d -p 8080:8080 --name smoke-test \
+            ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
+          sleep 8
+          curl --fail http://localhost:8080 || (docker logs smoke-test && exit 1)
+          docker stop smoke-test
+          echo "Smoke test passed"
+
+  # ─────────────────────────────────────────────
+  # JOB 2 — Push Image to ECR
+  # ─────────────────────────────────────────────
+  push-to-ecr:
+    name: Push Image to ECR
+    runs-on: ubuntu-latest
+    needs: ci
+    if: github.event_name == 'push'
+    outputs:
+      image_uri: ${{ steps.set-output.outputs.image_uri }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # ─── Docker: Build & Push ───────────────────────────────────
-      - name: Build, Tag, and Push Docker Image
-        id: build-image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      # ─── ECS: Render Task Definition ────────────────────────────
-      - name: Render Amazon ECS Task Definition
+      - name: Build and push to ECR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.ci.outputs.image_tag }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Set image URI output
+        id: set-output
+        run: |
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.ci.outputs.image_tag }}"
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Image pushed: $IMAGE_URI"
+
+  # ─────────────────────────────────────────────
+  # JOB 3 — Deploy to ECS (Blue-Green)
+  # ─────────────────────────────────────────────
+  deploy:
+    name: Deploy to ECS (Blue-Green)
+    runs-on: ubuntu-latest
+    needs: push-to-ecr
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download current ECS task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ vars.ECS_TASK_DEFINITION }} \
+            --query taskDefinition \
+            > task-definition.json
+          echo "Task definition downloaded"
+
+      - name: Render task definition with new image
         id: render-task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: task-definition.json
-          container-name: app
-          image: ${{ steps.build-image.outputs.image }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.push-to-ecr.outputs.image_uri }}
 
-      # ─── ECS: Blue-Green Deploy via CodeDeploy ──────────────────
-      - name: Deploy to ECS (Blue-Green)
+      - name: Deploy to ECS via CodeDeploy (Blue-Green)
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.render-task-def.outputs.task-definition }}
-          service: ${{ vars.ECS_SERVICE }}
-          cluster: ${{ vars.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
           codedeploy-appspec: appspec.yaml
           codedeploy-application: ${{ vars.CODEDEPLOY_APPLICATION }}
           codedeploy-deployment-group: ${{ vars.CODEDEPLOY_DEPLOYMENT_GROUP }}
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ needs.push-to-ecr.outputs.image_uri }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster | \`${{ env.ECS_CLUSTER }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | \`${{ env.ECS_SERVICE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | \`${{ github.actor }}\` |" >> $GITHUB_STEP_SUMMARY
