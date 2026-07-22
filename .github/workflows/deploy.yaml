@@ -150,6 +150,7 @@ jobs:
           aws ecs describe-task-definition \
             --task-definition ${{ vars.ECS_TASK_DEFINITION }} \
             --query taskDefinition \
+            | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .registeredAt, .registeredBy, .compatibilities)' \
             > task-definition.json
           echo "Task definition downloaded"
 
