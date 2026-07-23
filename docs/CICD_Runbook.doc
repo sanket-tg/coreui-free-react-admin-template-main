@@ -1,0 +1,216 @@
+<html xmlns:o="urn:schemas-microsoft-com:office:office"
+      xmlns:w="urn:schemas-microsoft-com:office:word"
+      xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta charset="utf-8">
+<title>CI/CD Automation Runbook</title>
+<style>
+  body { font-family: Segoe UI, Arial, sans-serif; margin: 40px 60px; color: #1a1a1a; line-height: 1.6; }
+  h1 { color: #0d47a1; border-bottom: 3px solid #0d47a1; padding-bottom: 8px; font-size: 24pt; }
+  h2 { color: #1565c0; margin-top: 24px; font-size: 16pt; border-bottom: 1px solid #e0e0e0; padding-bottom: 4px; }
+  h3 { color: #1976d2; font-size: 13pt; margin-top: 16px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #bdbdbd; padding: 8px 12px; text-align: left; font-size: 10pt; }
+  th { background-color: #e3f2fd; font-weight: bold; }
+  code { font-family: Consolas, monospace; background: #f5f5f5; padding: 2px 5px; font-size: 9pt; }
+  .section { page-break-inside: avoid; }
+  .note { background: #fff3e0; border-left: 4px solid #ff9800; padding: 8px 12px; margin: 12px 0; font-size: 10pt; }
+  .diagram-box { background: #f5f5f5; border: 1px solid #ccc; padding: 16px; margin: 12px 0; font-family: Consolas, monospace; font-size: 9pt; white-space: pre; line-height: 1.4; }
+  ul { margin: 6px 0; }
+  li { margin: 4px 0; font-size: 10pt; }
+  p { font-size: 10pt; margin: 6px 0; }
+  .footer { margin-top: 30px; border-top: 1px solid #ccc; padding-top: 10px; font-size: 9pt; color: #757575; }
+</style>
+</head>
+<body>
+
+<h1>CI/CD Automation Runbook</h1>
+
+<table>
+  <tr><th>Document Info</th><th>Details</th></tr>
+  <tr><td>Project</td><td>CoreUI React Admin Template</td></tr>
+  <tr><td>Repository</td><td>sanket-tg/coreui-free-react-admin-template-main</td></tr>
+  <tr><td>Pipeline</td><td>GitHub Actions &rarr; AWS ECR &rarr; ECS (Blue-Green via CodeDeploy)</td></tr>
+  <tr><td>Last Updated</td><td>July 2026</td></tr>
+  <tr><td>Author</td><td>Sanket Patil</td></tr>
+</table>
+
+<!-- ============ PAGE 1-2 ============ -->
+
+<h2>1. Architecture Overview</h2>
+
+<div class="diagram-box">
+Developer Push (main)
+        |
+        v
++-------------------+
+| GitHub Actions    |
+| (CI Job)          |
+| - Checkout        |
+| - npm ci          |
+| - npm run build   |
+| - Docker build    |
+| - Smoke test      |
++-------------------+
+        |
+        v
++-------------------+
+| Push to ECR       |
+| (tagged: sha +    |
+|  latest)          |
++-------------------+
+        |
+        v
++-------------------+
+| Deploy to ECS     |
+| (Blue-Green via   |
+|  CodeDeploy)      |
++-------------------+
+        |
+        v
++-------------------+
+| Live on Port 8080 |
+| (Nginx + React)   |
++-------------------+
+</div>
+
+<h2>2. Pipeline Triggers</h2>
+
+<table>
+  <tr><th>Event</th><th>Branch</th><th>Action</th></tr>
+  <tr><td>Push</td><td><code>main</code></td><td>Full pipeline: CI &rarr; Push &rarr; Deploy</td></tr>
+  <tr><td>Pull Request</td><td><code>main</code></td><td>CI only (build + smoke test, no deploy)</td></tr>
+  <tr><td>Manual</td><td>Any</td><td>Triggered via <code>workflow_dispatch</code> in GitHub UI</td></tr>
+</table>
+
+<!-- ============ PAGE 2-3 ============ -->
+
+<h2>3. Pipeline Jobs Breakdown</h2>
+
+<h3>Job 1: CI - Build &amp; Test</h3>
+<table>
+  <tr><th>Step</th><th>Description</th></tr>
+  <tr><td>Checkout</td><td>Pulls latest code from the repository</td></tr>
+  <tr><td>Set image tag</td><td>Uses short git SHA as the Docker image tag</td></tr>
+  <tr><td>Setup Node.js 22</td><td>Installs Node.js with npm cache</td></tr>
+  <tr><td>Install dependencies</td><td><code>npm ci</code> (clean install from lockfile)</td></tr>
+  <tr><td>Build React app</td><td><code>npm run build</code> produces production assets</td></tr>
+  <tr><td>AWS credential config</td><td>Assumes IAM role via OIDC (no stored keys)</td></tr>
+  <tr><td>ECR Login</td><td>Authenticates Docker to push/pull from ECR</td></tr>
+  <tr><td>Docker Build</td><td>Multi-stage build (Node build + Nginx serve)</td></tr>
+  <tr><td>Smoke Test</td><td>Starts container, waits 8s, curls port 8080</td></tr>
+</table>
+
+<h3>Job 2: Push Image to ECR</h3>
+<ul>
+  <li>Runs only on <code>push</code> events (not PRs)</li>
+  <li>Builds and pushes image with two tags: <code>&lt;sha&gt;</code> and <code>latest</code></li>
+  <li>Uses GitHub Actions build cache (<code>type=gha</code>) for speed</li>
+</ul>
+
+<h3>Job 3: Deploy to ECS (Blue-Green)</h3>
+<ul>
+  <li>Runs only when pushed to <code>main</code> branch</li>
+  <li>Downloads current ECS task definition</li>
+  <li>Renders new task definition with updated image URI</li>
+  <li>Deploys via AWS CodeDeploy blue-green strategy</li>
+  <li>Waits for service stability before marking success</li>
+  <li>Generates deployment summary in GitHub Actions UI</li>
+</ul>
+
+<!-- ============ PAGE 3-4 ============ -->
+
+<h2>4. AWS Infrastructure Components</h2>
+
+<table>
+  <tr><th>Component</th><th>Purpose</th></tr>
+  <tr><td>Amazon ECR</td><td>Docker image registry (stores built images)</td></tr>
+  <tr><td>Amazon ECS (Fargate)</td><td>Runs containerized app as a service</td></tr>
+  <tr><td>AWS CodeDeploy</td><td>Manages blue-green deployment switching</td></tr>
+  <tr><td>Application Load Balancer</td><td>Routes traffic to active (blue/green) target group</td></tr>
+  <tr><td>IAM OIDC Provider</td><td>Allows GitHub Actions to assume AWS roles without access keys</td></tr>
+</table>
+
+<h3>Key Configuration Variables (GitHub Settings)</h3>
+<table>
+  <tr><th>Type</th><th>Name</th><th>Description</th></tr>
+  <tr><td>Secret</td><td><code>AWS_ROLE_ARN</code></td><td>IAM role ARN for OIDC-based auth</td></tr>
+  <tr><td>Variable</td><td><code>AWS_REGION</code></td><td>AWS region (e.g., ap-south-1)</td></tr>
+  <tr><td>Variable</td><td><code>ECR_REPOSITORY</code></td><td>ECR repository name</td></tr>
+  <tr><td>Variable</td><td><code>ECS_CLUSTER</code></td><td>ECS cluster name</td></tr>
+  <tr><td>Variable</td><td><code>ECS_SERVICE</code></td><td>ECS service name</td></tr>
+  <tr><td>Variable</td><td><code>ECS_TASK_DEFINITION</code></td><td>Task definition family name</td></tr>
+  <tr><td>Variable</td><td><code>CODEDEPLOY_APPLICATION</code></td><td>CodeDeploy application name</td></tr>
+  <tr><td>Variable</td><td><code>CODEDEPLOY_DEPLOYMENT_GROUP</code></td><td>CodeDeploy deployment group</td></tr>
+</table>
+
+<!-- ============ PAGE 4-5 ============ -->
+
+<h2>5. Docker Build Strategy</h2>
+
+<p>Multi-stage Dockerfile for minimal production image:</p>
+
+<table>
+  <tr><th>Stage</th><th>Base Image</th><th>Purpose</th></tr>
+  <tr><td>Build</td><td><code>node:20-alpine</code></td><td>Install deps, compile React app</td></tr>
+  <tr><td>Serve</td><td><code>nginx:stable-alpine</code></td><td>Serve static assets on port 8080</td></tr>
+</table>
+
+<p>Nginx is configured to:</p>
+<ul>
+  <li>Serve from <code>/usr/share/nginx/html</code></li>
+  <li>Handle client-side routing (SPA fallback to <code>index.html</code>)</li>
+  <li>Cache static assets (CSS, JS, images) for 1 year</li>
+</ul>
+
+<h2>6. Deployment Flow (Blue-Green)</h2>
+
+<table>
+  <tr><th>Step</th><th>What Happens</th></tr>
+  <tr><td>1</td><td>New task definition registered with updated image</td></tr>
+  <tr><td>2</td><td>CodeDeploy launches new (green) task set</td></tr>
+  <tr><td>3</td><td>Health checks pass on green target group</td></tr>
+  <tr><td>4</td><td>Traffic shifts from blue to green</td></tr>
+  <tr><td>5</td><td>Old (blue) task set terminated after stabilization</td></tr>
+</table>
+
+<div class="note">
+  <strong>Note:</strong> If the green deployment fails health checks, CodeDeploy automatically rolls back to the blue (previous) version.
+</div>
+
+<h2>7. Troubleshooting Quick Reference</h2>
+
+<table>
+  <tr><th>Issue</th><th>Check</th></tr>
+  <tr><td>Pipeline not triggering</td><td>Verify push is to <code>main</code> branch; check Actions tab for workflow runs</td></tr>
+  <tr><td>AWS credential error</td><td>Verify <code>AWS_ROLE_ARN</code> secret and OIDC trust policy</td></tr>
+  <tr><td>Docker build fails</td><td>Check <code>npm ci</code> / <code>npm run build</code> logs; verify Node version</td></tr>
+  <tr><td>Smoke test fails</td><td>Container may need more startup time; check Nginx config</td></tr>
+  <tr><td>ECR push denied</td><td>Verify IAM role has <code>ecr:PutImage</code> permissions</td></tr>
+  <tr><td>ECS deploy stuck</td><td>Check ECS service events; verify task health checks and ALB target group health</td></tr>
+  <tr><td>Rollback triggered</td><td>Check CodeDeploy deployment logs for failure reason</td></tr>
+  <tr><td>Site not updating</td><td>Hard refresh browser (Ctrl+Shift+R); check if deploy job completed</td></tr>
+</table>
+
+<h2>8. Manual Operations</h2>
+
+<h3>Trigger Pipeline Manually</h3>
+<p>Go to GitHub &rarr; Actions &rarr; Select workflow &rarr; Click "Run workflow"</p>
+
+<h3>Rollback to Previous Version</h3>
+<p>Option A: Revert commit on <code>main</code> and push (triggers fresh deploy)<br>
+Option B: In AWS CodeDeploy console, select deployment &rarr; "Stop and roll back"</p>
+
+<h3>View Deployment Status</h3>
+<ul>
+  <li>GitHub: Actions tab &rarr; latest workflow run &rarr; Deploy job summary</li>
+  <li>AWS: ECS Console &rarr; Cluster &rarr; Service &rarr; Deployments tab</li>
+  <li>AWS: CodeDeploy Console &rarr; Deployments</li>
+</ul>
+
+<div class="footer">
+  <p>End of Document | CI/CD Automation Runbook | CoreUI React Admin Template</p>
+</div>
+
+</body>
+</html>
