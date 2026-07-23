@@ -1,17 +1,8 @@
 # ==============================================================================
 # CI/CD Pipeline - Main Terraform Configuration
+# SMART MODE: Discovers existing resources, only creates what's missing.
 # Dynamic deployment: EC2 / ECS / EKS
 # ==============================================================================
-
-terraform {
-  required_version = ">= 1.5.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-}
 
 provider "aws" {
   region = var.aws_region
@@ -29,18 +20,19 @@ data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
 
 locals {
-  account_id   = data.aws_caller_identity.current.account_id
-  partition    = data.aws_partition.current.partition
-  ecr_repo     = var.ecr_repository_name != "" ? var.ecr_repository_name : "${var.project_name}-${var.environment}"
-  cd_app_name  = var.codedeploy_app_name != "" ? var.codedeploy_app_name : "${var.project_name}-${var.environment}-app"
-  cd_dg_name   = var.codedeploy_deployment_group != "" ? var.codedeploy_deployment_group : "${var.project_name}-${var.environment}-dg"
+  account_id  = data.aws_caller_identity.current.account_id
+  partition   = data.aws_partition.current.partition
+  ecr_repo    = var.ecr_repository_name != "" ? var.ecr_repository_name : "${var.project_name}-${var.environment}"
+  cd_app_name = var.codedeploy_app_name != "" ? var.codedeploy_app_name : "${var.project_name}-${var.environment}-app"
+  cd_dg_name  = var.codedeploy_deployment_group != "" ? var.codedeploy_deployment_group : "${var.project_name}-${var.environment}-dg"
 }
 
 # ==============================================================================
-# ECR REPOSITORY
+# ECR REPOSITORY — Created only if NOT already present
 # ==============================================================================
 
 resource "aws_ecr_repository" "this" {
+  count                = local.ecr_exists ? 0 : 1
   name                 = local.ecr_repo
   image_tag_mutability = var.ecr_image_tag_mutability
   force_delete         = var.environment != "prod"
@@ -55,7 +47,8 @@ resource "aws_ecr_repository" "this" {
 }
 
 resource "aws_ecr_lifecycle_policy" "this" {
-  repository = aws_ecr_repository.this.name
+  count      = local.ecr_exists ? 0 : 1
+  repository = aws_ecr_repository.this[0].name
   policy = jsonencode({
     rules = [
       {
@@ -75,16 +68,23 @@ resource "aws_ecr_lifecycle_policy" "this" {
 }
 
 # ==============================================================================
-# IAM - GITHUB ACTIONS OIDC
+# OIDC PROVIDER — Created only if NOT already present
 # ==============================================================================
 
-data "aws_iam_openid_connect_provider" "github" {
-  count = 1
-  url   = "https://token.actions.githubusercontent.com"
+resource "aws_iam_openid_connect_provider" "github" {
+  count          = local.oidc_exists ? 0 : 1
+  url            = "https://token.actions.githubusercontent.com"
+  client_id_list = ["sts.amazonaws.com"]
+  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
 }
 
+# ==============================================================================
+# IAM ROLE - GITHUB ACTIONS — Created only if NOT already present
+# ==============================================================================
+
 resource "aws_iam_role" "github_actions" {
-  name = "${var.project_name}-${var.environment}-github-actions"
+  count = local.iam_role_exists ? 0 : 1
+  name  = "${var.project_name}-${var.environment}-github-actions"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -92,7 +92,7 @@ resource "aws_iam_role" "github_actions" {
       {
         Effect = "Allow"
         Principal = {
-          Federated = "arn:${local.partition}:iam::${local.account_id}:oidc-provider/token.actions.githubusercontent.com"
+          Federated = local.oidc_exists ? data.external.oidc_exists.result.arn : aws_iam_openid_connect_provider.github[0].arn
         }
         Action = "sts:AssumeRoleWithWebIdentity"
         Condition = {
@@ -110,11 +110,13 @@ resource "aws_iam_role" "github_actions" {
 
 # ------------------------------------------------------------------------------
 # IAM Policy - ECR Access (push/pull)
+# Attaches to existing or new role
 # ------------------------------------------------------------------------------
 
 resource "aws_iam_role_policy" "ecr_access" {
-  name = "ecr-access"
-  role = aws_iam_role.github_actions.id
+  count = local.iam_role_exists ? 0 : 1
+  name  = "ecr-access"
+  role  = aws_iam_role.github_actions[0].id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -122,9 +124,7 @@ resource "aws_iam_role_policy" "ecr_access" {
       {
         Sid    = "ECRAuth"
         Effect = "Allow"
-        Action = [
-          "ecr:GetAuthorizationToken"
-        ]
+        Action = ["ecr:GetAuthorizationToken"]
         Resource = "*"
       },
       {
@@ -141,20 +141,20 @@ resource "aws_iam_role_policy" "ecr_access" {
           "ecr:DescribeImages",
           "ecr:ListImages"
         ]
-        Resource = aws_ecr_repository.this.arn
+        Resource = "arn:${local.partition}:ecr:${var.aws_region}:${local.account_id}:repository/${local.ecr_repo}"
       }
     ]
   })
 }
 
 # ------------------------------------------------------------------------------
-# IAM Policy - ECS Deploy (conditional)
+# IAM Policy - ECS Deploy (conditional, only if role is new)
 # ------------------------------------------------------------------------------
 
 resource "aws_iam_role_policy" "ecs_deploy" {
-  count = var.deploy_target == "ecs" ? 1 : 0
+  count = var.deploy_target == "ecs" && !local.iam_role_exists ? 1 : 0
   name  = "ecs-deploy"
-  role  = aws_iam_role.github_actions.id
+  role  = aws_iam_role.github_actions[0].id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -179,11 +179,19 @@ resource "aws_iam_role_policy" "ecs_deploy" {
           "ecs:DescribeTasks"
         ]
         Resource = "*"
-        Condition = {
-          StringEquals = {
-            "ecs:cluster" = "arn:${local.partition}:ecs:${var.aws_region}:${local.account_id}:cluster/${var.ecs_cluster_name}"
-          }
-        }
+      },
+      {
+        Sid    = "CodeDeployECS"
+        Effect = "Allow"
+        Action = [
+          "codedeploy:CreateDeployment",
+          "codedeploy:GetDeployment",
+          "codedeploy:GetDeploymentConfig",
+          "codedeploy:GetApplicationRevision",
+          "codedeploy:RegisterApplicationRevision",
+          "codedeploy:GetApplication"
+        ]
+        Resource = "*"
       },
       {
         Sid    = "PassRole"
@@ -201,13 +209,13 @@ resource "aws_iam_role_policy" "ecs_deploy" {
 }
 
 # ------------------------------------------------------------------------------
-# IAM Policy - EKS Deploy (conditional)
+# IAM Policy - EKS Deploy (conditional, only if role is new)
 # ------------------------------------------------------------------------------
 
 resource "aws_iam_role_policy" "eks_deploy" {
-  count = var.deploy_target == "eks" ? 1 : 0
+  count = var.deploy_target == "eks" && !local.iam_role_exists ? 1 : 0
   name  = "eks-deploy"
-  role  = aws_iam_role.github_actions.id
+  role  = aws_iam_role.github_actions[0].id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -232,13 +240,13 @@ resource "aws_iam_role_policy" "eks_deploy" {
 }
 
 # ------------------------------------------------------------------------------
-# IAM Policy - EC2 CodeDeploy (conditional)
+# IAM Policy - EC2 CodeDeploy (conditional, only if role is new)
 # ------------------------------------------------------------------------------
 
 resource "aws_iam_role_policy" "ec2_deploy" {
-  count = var.deploy_target == "ec2" ? 1 : 0
+  count = var.deploy_target == "ec2" && !local.iam_role_exists ? 1 : 0
   name  = "ec2-codedeploy"
-  role  = aws_iam_role.github_actions.id
+  role  = aws_iam_role.github_actions[0].id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -266,8 +274,8 @@ resource "aws_iam_role_policy" "ec2_deploy" {
           "s3:GetBucketLocation"
         ]
         Resource = [
-          aws_s3_bucket.artifacts[0].arn,
-          "${aws_s3_bucket.artifacts[0].arn}/*"
+          "arn:${local.partition}:s3:::${var.project_name}-${var.environment}-deploy-artifacts-${local.account_id}",
+          "arn:${local.partition}:s3:::${var.project_name}-${var.environment}-deploy-artifacts-${local.account_id}/*"
         ]
       }
     ]
@@ -275,17 +283,17 @@ resource "aws_iam_role_policy" "ec2_deploy" {
 }
 
 # ==============================================================================
-# S3 BUCKET - Artifacts (EC2 CodeDeploy)
+# S3 BUCKET - Artifacts (EC2 only, created if NOT present)
 # ==============================================================================
 
 resource "aws_s3_bucket" "artifacts" {
-  count         = var.deploy_target == "ec2" ? 1 : 0
+  count         = var.deploy_target == "ec2" && !local.s3_bucket_exists ? 1 : 0
   bucket        = "${var.project_name}-${var.environment}-deploy-artifacts-${local.account_id}"
   force_destroy = var.environment != "prod"
 }
 
 resource "aws_s3_bucket_versioning" "artifacts" {
-  count  = var.deploy_target == "ec2" ? 1 : 0
+  count  = var.deploy_target == "ec2" && !local.s3_bucket_exists ? 1 : 0
   bucket = aws_s3_bucket.artifacts[0].id
   versioning_configuration {
     status = "Enabled"
@@ -293,7 +301,7 @@ resource "aws_s3_bucket_versioning" "artifacts" {
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
-  count  = var.deploy_target == "ec2" ? 1 : 0
+  count  = var.deploy_target == "ec2" && !local.s3_bucket_exists ? 1 : 0
   bucket = aws_s3_bucket.artifacts[0].id
   rule {
     apply_server_side_encryption_by_default {
@@ -304,7 +312,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
 }
 
 resource "aws_s3_bucket_public_access_block" "artifacts" {
-  count                   = var.deploy_target == "ec2" ? 1 : 0
+  count                   = var.deploy_target == "ec2" && !local.s3_bucket_exists ? 1 : 0
   bucket                  = aws_s3_bucket.artifacts[0].id
   block_public_acls       = true
   block_public_policy     = true
@@ -313,17 +321,17 @@ resource "aws_s3_bucket_public_access_block" "artifacts" {
 }
 
 # ==============================================================================
-# CODEDEPLOY - EC2
+# CODEDEPLOY - EC2 (created only if NOT present)
 # ==============================================================================
 
 resource "aws_codedeploy_app" "ec2" {
-  count            = var.deploy_target == "ec2" ? 1 : 0
+  count            = var.deploy_target == "ec2" && !local.codedeploy_exists ? 1 : 0
   name             = local.cd_app_name
   compute_platform = "Server"
 }
 
 resource "aws_iam_role" "codedeploy_ec2" {
-  count = var.deploy_target == "ec2" ? 1 : 0
+  count = var.deploy_target == "ec2" && !local.codedeploy_exists ? 1 : 0
   name  = "${var.project_name}-${var.environment}-codedeploy-role"
 
   assume_role_policy = jsonencode({
@@ -339,16 +347,16 @@ resource "aws_iam_role" "codedeploy_ec2" {
 }
 
 resource "aws_iam_role_policy_attachment" "codedeploy_ec2" {
-  count      = var.deploy_target == "ec2" ? 1 : 0
+  count      = var.deploy_target == "ec2" && !local.codedeploy_exists ? 1 : 0
   role       = aws_iam_role.codedeploy_ec2[0].name
   policy_arn = "arn:${local.partition}:iam::aws:policy/service-role/AWSCodeDeployRole"
 }
 
 resource "aws_codedeploy_deployment_group" "ec2" {
-  count                  = var.deploy_target == "ec2" ? 1 : 0
-  app_name               = aws_codedeploy_app.ec2[0].name
+  count                  = var.deploy_target == "ec2" && !local.codedeploy_dg_exists ? 1 : 0
+  app_name               = local.codedeploy_exists ? local.cd_app_name : aws_codedeploy_app.ec2[0].name
   deployment_group_name  = local.cd_dg_name
-  service_role_arn       = aws_iam_role.codedeploy_ec2[0].arn
+  service_role_arn       = local.codedeploy_exists ? "arn:${local.partition}:iam::${local.account_id}:role/${var.project_name}-${var.environment}-codedeploy-role" : aws_iam_role.codedeploy_ec2[0].arn
   deployment_config_name = var.ec2_deployment_config
 
   dynamic "ec2_tag_filter" {
@@ -360,21 +368,18 @@ resource "aws_codedeploy_deployment_group" "ec2" {
     }
   }
 
-  dynamic "auto_rollback_configuration" {
-    for_each = [1]
-    content {
-      enabled = true
-      events  = ["DEPLOYMENT_FAILURE"]
-    }
+  auto_rollback_configuration {
+    enabled = true
+    events  = ["DEPLOYMENT_FAILURE"]
   }
 }
 
 # ==============================================================================
-# CODEDEPLOY - ECS Blue-Green
+# CODEDEPLOY - ECS Blue-Green (created only if NOT present)
 # ==============================================================================
 
 resource "aws_codedeploy_app" "ecs" {
-  count            = var.deploy_target == "ecs" && var.ecs_deployment_type == "blue-green" ? 1 : 0
+  count            = var.deploy_target == "ecs" && var.ecs_deployment_type == "blue-green" && !local.codedeploy_exists ? 1 : 0
   name             = local.cd_app_name
   compute_platform = "ECS"
 }

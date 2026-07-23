@@ -1,20 +1,32 @@
 # ==============================================================================
 # CI/CD Pipeline - Outputs
+# Smart: Returns values from existing resources or newly created ones
 # ==============================================================================
+
+output "discovery_summary" {
+  description = "What was found vs what was created"
+  value = {
+    ecr_repository = local.ecr_exists ? "FOUND (existing)" : "CREATED"
+    iam_role       = local.iam_role_exists ? "FOUND (existing)" : "CREATED"
+    oidc_provider  = local.oidc_exists ? "FOUND (existing)" : "CREATED"
+    codedeploy_app = local.codedeploy_exists ? "FOUND (existing)" : (var.deploy_target != "eks" ? "CREATED" : "N/A")
+    s3_bucket      = local.s3_bucket_exists ? "FOUND (existing)" : (var.deploy_target == "ec2" ? "CREATED" : "N/A")
+  }
+}
 
 output "github_actions_role_arn" {
   description = "IAM Role ARN for GitHub Actions (set as AWS_ROLE_ARN secret)"
-  value       = aws_iam_role.github_actions.arn
+  value       = local.iam_role_arn
 }
 
 output "ecr_repository_url" {
   description = "ECR repository URL"
-  value       = aws_ecr_repository.this.repository_url
+  value       = local.ecr_url
 }
 
 output "ecr_repository_name" {
   description = "ECR repository name"
-  value       = aws_ecr_repository.this.name
+  value       = local.ecr_repo
 }
 
 output "deploy_target" {
@@ -23,18 +35,18 @@ output "deploy_target" {
 }
 
 output "codedeploy_app_name" {
-  description = "CodeDeploy application name (EC2/ECS blue-green)"
-  value       = var.deploy_target == "ec2" ? try(aws_codedeploy_app.ec2[0].name, "") : try(aws_codedeploy_app.ecs[0].name, "")
+  description = "CodeDeploy application name"
+  value       = local.cd_app_name
 }
 
 output "codedeploy_deployment_group" {
   description = "CodeDeploy deployment group (EC2)"
-  value       = var.deploy_target == "ec2" ? try(aws_codedeploy_deployment_group.ec2[0].deployment_group_name, "") : ""
+  value       = var.deploy_target == "ec2" ? local.cd_dg_name : ""
 }
 
 output "artifacts_bucket" {
   description = "S3 bucket for deployment artifacts (EC2 only)"
-  value       = var.deploy_target == "ec2" ? try(aws_s3_bucket.artifacts[0].bucket, "") : ""
+  value       = var.deploy_target == "ec2" ? "${var.project_name}-${var.environment}-deploy-artifacts-${local.account_id}" : ""
 }
 
 output "sns_topic_arn" {
@@ -43,31 +55,33 @@ output "sns_topic_arn" {
 }
 
 # ==============================================================================
-# GitHub Repository Variables (set these in GitHub Settings > Variables)
+# GitHub Configuration Guide
 # ==============================================================================
 
-output "github_variables_to_set" {
-  description = "Variables to configure in GitHub repository settings"
+output "github_secrets_to_set" {
+  description = "Secrets to configure in GitHub (Settings → Secrets → Actions)"
   value = {
-    AWS_REGION                 = var.aws_region
-    ECR_REPOSITORY             = aws_ecr_repository.this.name
-    DEPLOY_TARGET              = var.deploy_target
-    ECS_CLUSTER                = var.deploy_target == "ecs" ? var.ecs_cluster_name : ""
-    ECS_SERVICE                = var.deploy_target == "ecs" ? var.ecs_service_name : ""
-    ECS_TASK_DEFINITION        = var.deploy_target == "ecs" ? var.ecs_task_family : ""
-    ECS_CONTAINER_NAME         = var.deploy_target == "ecs" ? var.ecs_container_name : ""
-    EKS_CLUSTER                = var.deploy_target == "eks" ? var.eks_cluster_name : ""
-    EKS_NAMESPACE              = var.deploy_target == "eks" ? var.eks_namespace : ""
-    EKS_DEPLOYMENT_NAME        = var.deploy_target == "eks" ? var.eks_deployment_name : ""
-    CODEDEPLOY_APPLICATION     = var.deploy_target != "eks" ? local.cd_app_name : ""
-    CODEDEPLOY_DEPLOYMENT_GROUP = var.deploy_target == "ec2" ? local.cd_dg_name : ""
-    ARTIFACTS_BUCKET           = var.deploy_target == "ec2" ? try(aws_s3_bucket.artifacts[0].bucket, "") : ""
+    AWS_ROLE_ARN = local.iam_role_arn
   }
 }
 
-output "github_secrets_to_set" {
-  description = "Secrets to configure in GitHub repository settings"
+output "github_variables_to_set" {
+  description = "Variables to configure in GitHub (Settings → Variables → Actions)"
   value = {
-    AWS_ROLE_ARN = aws_iam_role.github_actions.arn
+    AWS_REGION                  = var.aws_region
+    ECR_REPOSITORY              = local.ecr_repo
+    DEPLOY_TARGET               = var.deploy_target
+    ENABLE_SNYK                 = tostring(var.enable_snyk_scan)
+    ECS_CLUSTER                 = var.deploy_target == "ecs" ? var.ecs_cluster_name : ""
+    ECS_SERVICE                 = var.deploy_target == "ecs" ? var.ecs_service_name : ""
+    ECS_TASK_DEFINITION         = var.deploy_target == "ecs" ? var.ecs_task_family : ""
+    ECS_CONTAINER_NAME          = var.deploy_target == "ecs" ? var.ecs_container_name : ""
+    ECS_DEPLOYMENT_TYPE         = var.deploy_target == "ecs" ? var.ecs_deployment_type : ""
+    EKS_CLUSTER                 = var.deploy_target == "eks" ? var.eks_cluster_name : ""
+    EKS_NAMESPACE               = var.deploy_target == "eks" ? var.eks_namespace : ""
+    EKS_DEPLOYMENT_NAME         = var.deploy_target == "eks" ? var.eks_deployment_name : ""
+    CODEDEPLOY_APPLICATION      = var.deploy_target != "eks" ? local.cd_app_name : ""
+    CODEDEPLOY_DEPLOYMENT_GROUP = var.deploy_target == "ec2" ? local.cd_dg_name : ""
+    ARTIFACTS_BUCKET            = var.deploy_target == "ec2" ? "${var.project_name}-${var.environment}-deploy-artifacts-${local.account_id}" : ""
   }
 }

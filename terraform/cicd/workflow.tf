@@ -26,7 +26,7 @@ resource "local_file" "github_vars_guide" {
 
 | Secret | Value |
 |--------|-------|
-| `AWS_ROLE_ARN` | `${aws_iam_role.github_actions.arn}` |
+| `AWS_ROLE_ARN` | `${local.iam_role_arn}` |
 | `SNYK_TOKEN` | *(from snyk.io dashboard, optional)* |
 
 ## Variables (Settings → Variables → Actions)
@@ -34,7 +34,7 @@ resource "local_file" "github_vars_guide" {
 | Variable | Value |
 |----------|-------|
 | `AWS_REGION` | `${var.aws_region}` |
-| `ECR_REPOSITORY` | `${aws_ecr_repository.this.name}` |
+| `ECR_REPOSITORY` | `${local.ecr_repo}` |
 | `DEPLOY_TARGET` | `${var.deploy_target}` |
 | `ENABLE_SNYK` | `${var.enable_snyk_scan}` |
 %{if var.deploy_target == "ecs"~}
@@ -54,7 +54,7 @@ resource "local_file" "github_vars_guide" {
 %{if var.deploy_target == "ec2"~}
 | `CODEDEPLOY_APPLICATION` | `${local.cd_app_name}` |
 | `CODEDEPLOY_DEPLOYMENT_GROUP` | `${local.cd_dg_name}` |
-| `ARTIFACTS_BUCKET` | `${try(aws_s3_bucket.artifacts[0].bucket, "")}` |
+| `ARTIFACTS_BUCKET` | `${var.project_name}-${var.environment}-deploy-artifacts-${local.account_id}` |
 %{endif~}
 
 ## Pipeline Trigger

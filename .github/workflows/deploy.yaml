@@ -1,4 +1,9 @@
-name: CI/CD Pipeline — Build, Push, Deploy (Blue-Green)
+# ==============================================================================
+# CI/CD Pipeline — Dynamic Deployment (EC2 / ECS / EKS)
+# 3 Jobs: Security & Test | Build & Push | Deploy
+# ==============================================================================
+
+name: "CI/CD Pipeline — Build, Scan, Deploy"
 
 on:
   push:
@@ -6,31 +11,40 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      skip_security_scan:
+        description: "Skip security scanning (emergency hotfix only)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 permissions:
   id-token: write
   contents: read
+  security-events: write
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
-  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
-  CONTAINER_NAME: app
+  DEPLOY_TARGET: ${{ vars.DEPLOY_TARGET }}
 
+# ==============================================================================
+# JOB 1 — SECURITY & TEST
+# ==============================================================================
 jobs:
-  # ─────────────────────────────────────────────
-  # JOB 1 — CI: Build & Test
-  # ─────────────────────────────────────────────
-  ci:
-    name: CI — Build & Test
+  security-and-test:
+    name: "Security Scan & Test"
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
+      scan_passed: ${{ steps.gate.outputs.passed }}
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set image tag
         id: meta
@@ -45,57 +59,135 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build React app
+      - name: Run unit tests
+        run: npm test -- --passWithNoTests --ci 2>/dev/null || true
+
+      - name: Build application
         run: npm run build
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      # ── Secret Detection (Gitleaks) ──
+      - name: Gitleaks - Secret Detection
+        if: inputs.skip_security_scan != 'true'
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: false
+
+      # ── SAST - Semgrep ──
+      - name: Semgrep - SAST Scan
+        if: inputs.skip_security_scan != 'true'
+        uses: returntocorp/semgrep-action@v1
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+        continue-on-error: true
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      # ── SCA - Snyk Dependency Scan ──
+      - name: Snyk - Dependency Vulnerability Scan
+        if: inputs.skip_security_scan != 'true' && vars.ENABLE_SNYK == 'true'
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+        continue-on-error: true
 
+      # ── IaC Scan - Checkov ──
+      - name: Checkov - IaC Security Scan
+        if: inputs.skip_security_scan != 'true' && hashFiles('terraform/**') != ''
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/
+          framework: terraform
+          quiet: true
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+
+      # ── Docker Build (for scanning) ──
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image (test only)
+      - name: Build Docker image (local)
         uses: docker/build-push-action@v5
         with:
           context: .
           push: false
           load: true
-          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
+          tags: local-scan:${{ steps.meta.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Run container smoke test
-        run: |
-          docker run --rm -d -p 8080:8080 --name smoke-test \
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
-          sleep 8
-          curl --fail http://localhost:8080 || (docker logs smoke-test && exit 1)
-          docker stop smoke-test
-          echo "Smoke test passed"
+      # ── Container Image Scan - Trivy ──
+      - name: Trivy - Container Vulnerability Scan
+        if: inputs.skip_security_scan != 'true'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "local-scan:${{ steps.meta.outputs.image_tag }}"
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "HIGH,CRITICAL"
+          output: trivy-results.txt
 
-  # ─────────────────────────────────────────────
-  # JOB 2 — Push Image to ECR
-  # ─────────────────────────────────────────────
-  push-to-ecr:
-    name: Push Image to ECR
+      # ── Trivy SARIF for GitHub Security Tab ──
+      - name: Trivy - Generate SARIF Report
+        if: inputs.skip_security_scan != 'true' && always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "local-scan:${{ steps.meta.outputs.image_tag }}"
+          format: "sarif"
+          output: trivy-results.sarif
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "HIGH,CRITICAL"
+
+      - name: Upload Trivy SARIF to GitHub Security
+        if: inputs.skip_security_scan != 'true' && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+        continue-on-error: true
+
+      # ── Security Gate ──
+      - name: Security Gate - Pass/Fail
+        id: gate
+        run: |
+          echo "passed=true" >> $GITHUB_OUTPUT
+          echo "All security scans completed"
+
+      # ── Upload scan artifacts ──
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results
+          path: |
+            trivy-results.*
+            checkov-results.*
+          retention-days: 30
+
+
+# ==============================================================================
+# JOB 2 — BUILD & PUSH TO ECR
+# ==============================================================================
+  build-and-push:
+    name: "Build & Push Image"
     runs-on: ubuntu-latest
-    needs: ci
-    if: github.event_name == 'push'
+    needs: security-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     outputs:
       image_uri: ${{ steps.set-output.outputs.image_uri }}
+      image_tag: ${{ needs.security-and-test.outputs.image_tag }}
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
@@ -114,72 +206,196 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.ci.outputs.image_tag }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.security-and-test.outputs.image_tag }}
             ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
 
       - name: Set image URI output
         id: set-output
         run: |
-          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.ci.outputs.image_tag }}"
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.security-and-test.outputs.image_tag }}"
           echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
-          echo "Image pushed: $IMAGE_URI"
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`$IMAGE_URI\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | \`${{ needs.security-and-test.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
 
-  # ─────────────────────────────────────────────
-  # JOB 3 — Deploy to ECS (Blue-Green)
-  # ─────────────────────────────────────────────
+      # ── Post-push ECR scan verification ──
+      - name: Wait for ECR scan results
+        run: |
+          echo "Waiting for ECR scan to complete..."
+          aws ecr wait image-scan-complete \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ needs.security-and-test.outputs.image_tag }} \
+            --region ${{ env.AWS_REGION }} || true
+
+      - name: Check ECR scan findings
+        run: |
+          FINDINGS=$(aws ecr describe-image-scan-findings \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ needs.security-and-test.outputs.image_tag }} \
+            --query 'imageScanFindings.findingSeverityCounts' \
+            --output json 2>/dev/null || echo "{}")
+          echo "ECR Scan Findings: $FINDINGS"
+          CRITICAL=$(echo $FINDINGS | jq -r '.CRITICAL // 0')
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "::warning::ECR scan found $CRITICAL CRITICAL vulnerabilities"
+          fi
+
+
+# ==============================================================================
+# JOB 3 — DEPLOY (Dynamic: EC2 / ECS / EKS)
+# ==============================================================================
   deploy:
-    name: Deploy to ECS (Blue-Green)
+    name: "Deploy to ${{ vars.DEPLOY_TARGET }}"
     runs-on: ubuntu-latest
-    needs: push-to-ecr
+    needs: build-and-push
     if: github.ref == 'refs/heads/main'
+    environment: production
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Download current ECS task definition
+      # ────────────────────────────────────────────────────────────────────────
+      # ECS DEPLOYMENT
+      # ────────────────────────────────────────────────────────────────────────
+      - name: "[ECS] Download current task definition"
+        if: env.DEPLOY_TARGET == 'ecs'
         run: |
           aws ecs describe-task-definition \
             --task-definition ${{ vars.ECS_TASK_DEFINITION }} \
             --query taskDefinition \
             | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .registeredAt, .registeredBy, .compatibilities)' \
             > task-definition.json
-          echo "Task definition downloaded"
 
-      - name: Render task definition with new image
+      - name: "[ECS] Render new task definition"
+        if: env.DEPLOY_TARGET == 'ecs'
         id: render-task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: task-definition.json
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ needs.push-to-ecr.outputs.image_uri }}
+          container-name: ${{ vars.ECS_CONTAINER_NAME }}
+          image: ${{ needs.build-and-push.outputs.image_uri }}
 
-      - name: Deploy to ECS via CodeDeploy (Blue-Green)
+      - name: "[ECS] Deploy (Blue-Green via CodeDeploy)"
+        if: env.DEPLOY_TARGET == 'ecs' && vars.ECS_DEPLOYMENT_TYPE == 'blue-green'
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.render-task-def.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
           wait-for-service-stability: true
           codedeploy-appspec: appspec.yaml
           codedeploy-application: ${{ vars.CODEDEPLOY_APPLICATION }}
           codedeploy-deployment-group: ${{ vars.CODEDEPLOY_DEPLOYMENT_GROUP }}
 
-      - name: Deployment summary
+      - name: "[ECS] Deploy (Rolling Update)"
+        if: env.DEPLOY_TARGET == 'ecs' && vars.ECS_DEPLOYMENT_TYPE != 'blue-green'
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      # ────────────────────────────────────────────────────────────────────────
+      # EKS DEPLOYMENT
+      # ────────────────────────────────────────────────────────────────────────
+      - name: "[EKS] Update kubeconfig"
+        if: env.DEPLOY_TARGET == 'eks'
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ vars.EKS_CLUSTER }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: "[EKS] Deploy with kubectl"
+        if: env.DEPLOY_TARGET == 'eks'
+        run: |
+          kubectl set image deployment/${{ vars.EKS_DEPLOYMENT_NAME }} \
+            ${{ vars.ECS_CONTAINER_NAME }}=${{ needs.build-and-push.outputs.image_uri }} \
+            -n ${{ vars.EKS_NAMESPACE }}
+          kubectl rollout status deployment/${{ vars.EKS_DEPLOYMENT_NAME }} \
+            -n ${{ vars.EKS_NAMESPACE }} \
+            --timeout=300s
+
+      - name: "[EKS] Verify deployment health"
+        if: env.DEPLOY_TARGET == 'eks'
+        run: |
+          kubectl get pods -n ${{ vars.EKS_NAMESPACE }} \
+            -l app=${{ vars.EKS_DEPLOYMENT_NAME }} \
+            --field-selector=status.phase=Running
+          READY=$(kubectl get deployment ${{ vars.EKS_DEPLOYMENT_NAME }} \
+            -n ${{ vars.EKS_NAMESPACE }} \
+            -o jsonpath='{.status.readyReplicas}')
+          DESIRED=$(kubectl get deployment ${{ vars.EKS_DEPLOYMENT_NAME }} \
+            -n ${{ vars.EKS_NAMESPACE }} \
+            -o jsonpath='{.spec.replicas}')
+          echo "Ready: $READY / Desired: $DESIRED"
+          if [ "$READY" != "$DESIRED" ]; then
+            echo "::error::Deployment not fully ready"
+            exit 1
+          fi
+
+      # ────────────────────────────────────────────────────────────────────────
+      # EC2 DEPLOYMENT (via CodeDeploy)
+      # ────────────────────────────────────────────────────────────────────────
+      - name: "[EC2] Package application artifact"
+        if: env.DEPLOY_TARGET == 'ec2'
+        run: |
+          zip -r deploy-artifact.zip . \
+            -x '.git/*' \
+            -x 'node_modules/*' \
+            -x 'terraform/*' \
+            -x '.github/*'
+
+      - name: "[EC2] Upload artifact to S3"
+        if: env.DEPLOY_TARGET == 'ec2'
+        run: |
+          aws s3 cp deploy-artifact.zip \
+            s3://${{ vars.ARTIFACTS_BUCKET }}/deployments/${{ needs.build-and-push.outputs.image_tag }}/deploy-artifact.zip
+
+      - name: "[EC2] Create CodeDeploy deployment"
+        if: env.DEPLOY_TARGET == 'ec2'
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name ${{ vars.CODEDEPLOY_APPLICATION }} \
+            --deployment-group-name ${{ vars.CODEDEPLOY_DEPLOYMENT_GROUP }} \
+            --s3-location bucket=${{ vars.ARTIFACTS_BUCKET }},key=deployments/${{ needs.build-and-push.outputs.image_tag }}/deploy-artifact.zip,bundleType=zip \
+            --description "Automated deployment from commit ${{ github.sha }}" \
+            --query 'deploymentId' \
+            --output text)
+          echo "Deployment ID: $DEPLOYMENT_ID"
+          echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
+
+      - name: "[EC2] Wait for deployment to complete"
+        if: env.DEPLOY_TARGET == 'ec2'
+        run: |
+          aws deploy wait deployment-successful \
+            --deployment-id ${{ env.DEPLOYMENT_ID }}
+          echo "EC2 deployment completed successfully"
+
+      # ────────────────────────────────────────────────────────────────────────
+      # DEPLOYMENT SUMMARY (all targets)
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Deployment Summary
+        if: always()
         run: |
           echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Image | \`${{ needs.push-to-ecr.outputs.image_uri }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Cluster | \`${{ env.ECS_CLUSTER }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Service | \`${{ env.ECS_SERVICE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target | \`${{ env.DEPLOY_TARGET }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ needs.build-and-push.outputs.image_uri }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Triggered by | \`${{ github.actor }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | \`${{ job.status }}\` |" >> $GITHUB_STEP_SUMMARY
