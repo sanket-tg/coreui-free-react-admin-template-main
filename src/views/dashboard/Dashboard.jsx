@@ -178,6 +178,7 @@ const Dashboard = () => {
 
   return (
     <>
+      <h2 className="mb-4 text-center">Pipeline deployment test - changes detected!</h2>
       <WidgetsDropdown className="mb-4" />
       <CCard className="mb-4">
         <CCardBody>
